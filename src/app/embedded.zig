@@ -1,0 +1,1836 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = @import("../quirks.zig").inlineAssert;
+const Allocator = std.mem.Allocator;
+const objc = @import("objc");
+const apprt = @import("../apprt.zig");
+const font = @import("../font/root.zig");
+const global = @import("../global.zig");
+const input = @import("../input.zig");
+const internal_os = @import("../os/root.zig");
+const renderer = @import("../renderer.zig");
+const terminal = @import("../terminal/main.zig");
+const CoreApp = @import("../App.zig");
+const CoreInspector = @import("../inspector/root.zig").Inspector;
+const CoreSurface = @import("../Surface.zig");
+const configpkg = @import("../config.zig");
+const Config = configpkg.Config;
+const String = @import("../main_c.zig").String;
+const log = std.log.scoped(.embedded_window);
+pub const resourcesDir = internal_os.resourcesDir;
+pub const App = struct {
+    pub const Options = extern struct {
+        const AppUD = ?*anyopaque;
+        const SurfaceUD = ?*anyopaque;
+        userdata: AppUD = null,
+        supports_selection_clipboard: bool = false,
+        wakeup: *const fn (AppUD) callconv(.c) void,
+        action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
+        read_clipboard: *const fn (
+            SurfaceUD,
+            c_int,
+            *apprt.ClipboardRequest,
+            [*]const [*:0]const u8,
+            usize,
+            bool,
+        ) callconv(.c) apprt.ClipboardReadResult,
+        confirm_read_clipboard: *const fn (
+            SurfaceUD,
+            *const CAPI.ClipboardConfirm,
+            *apprt.ClipboardRequest,
+            apprt.ClipboardRequestType,
+        ) callconv(.c) void,
+        write_clipboard: *const fn (
+            SurfaceUD,
+            c_int,
+            [*]const CAPI.ClipboardContent,
+            usize,
+            bool,
+        ) callconv(.c) void,
+        close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+    };
+    pub const KeyEvent = struct {
+        action: input.Action,
+        mods: input.Mods,
+        consumed_mods: input.Mods,
+        keycode: u32,
+        text: ?[:0]const u8,
+        unshifted_codepoint: u32,
+        composing: bool,
+        fn core(self: KeyEvent) ?input.KeyEvent {
+            const text: []const u8 = if (self.text) |v| v else "";
+            const unshifted_codepoint: u21 = std.math.cast(
+                u21,
+                self.unshifted_codepoint,
+            ) orelse 0;
+            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+                if (entry.native == self.keycode) break :keycode entry.key;
+            } else .unidentified;
+            return .{
+                .action = self.action,
+                .key = physical_key,
+                .mods = self.mods,
+                .consumed_mods = self.consumed_mods,
+                .composing = self.composing,
+                .utf8 = text,
+                .unshifted_codepoint = unshifted_codepoint,
+            };
+        }
+    };
+    core_app: *CoreApp,
+    opts: Options,
+    keymap: ?input.Keymap,
+    config: Config,
+    pub fn init(
+        self: *App,
+        core_app: *CoreApp,
+        config: *const Config,
+        opts: Options,
+    ) !void {
+        const alloc = core_app.alloc;
+        var config_clone = try config.clone(alloc);
+        errdefer config_clone.deinit();
+        self.* = .{
+            .core_app = core_app,
+            .config = config_clone,
+            .opts = opts,
+            .keymap = null,
+        };
+    }
+    pub fn terminate(self: *App) void {
+        if (self.keymap) |*v| v.deinit();
+        self.config.deinit();
+    }
+    pub fn hasGlobalKeybinds(self: *const App) bool {
+        var it = self.config.keybind.set.bindings.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .leader => {},
+                inline .leaf, .leaf_chained => |leaf| if (leaf.flags.global) return true,
+            }
+        }
+        return false;
+    }
+    pub const KeyTarget = union(enum) {
+        app,
+        surface: *Surface,
+    };
+    pub fn focusEvent(self: *App, focused: bool) void {
+        self.core_app.focusEvent(focused);
+    }
+    pub fn keyEvent(
+        self: *App,
+        target: KeyTarget,
+        event: KeyEvent,
+    ) !bool {
+        const input_event: input.KeyEvent = event.core() orelse
+            return false;
+        const effect: CoreSurface.InputEffect = switch (target) {
+            .app => if (self.core_app.keyEvent(
+                self,
+                input_event,
+            )) .consumed else .ignored,
+            .surface => |surface| try surface.core_surface.keyCallback(
+                input_event,
+            ),
+        };
+        return switch (effect) {
+            .closed => true,
+            .ignored => false,
+            .consumed => true,
+        };
+    }
+    pub fn reloadKeymap(self: *App) !void {
+        if (self.keymap) |*v| try v.reload();
+    }
+    pub fn keyboardLayout(self: *App) input.KeyboardLayout {
+        if (comptime builtin.os.tag != .macos) return .unknown;
+        const keymap: *input.Keymap = keymap: {
+            if (self.keymap == null) {
+                self.keymap = input.Keymap.init() catch |err| {
+                    log.warn("error initializing keymap err={}", .{err});
+                    return .unknown;
+                };
+            }
+            break :keymap &self.keymap.?;
+        };
+        var buf: [256]u8 = undefined;
+        const id = keymap.sourceId(&buf) catch |err| {
+            comptime assert(@TypeOf(err) == error{OutOfMemory});
+            return .unknown;
+        };
+        return input.KeyboardLayout.mapAppleId(id) orelse .unknown;
+    }
+    pub fn wakeup(self: *const App) void {
+        self.opts.wakeup(self.opts.userdata);
+    }
+    pub fn wait(self: *const App) !void {
+        _ = self;
+    }
+    fn newSurface(self: *App, opts: Surface.Options) !*Surface {
+        var surface = try self.core_app.alloc.create(Surface);
+        errdefer self.core_app.alloc.destroy(surface);
+        try surface.init(self, opts);
+        errdefer surface.deinit();
+        return surface;
+    }
+    pub fn closeSurface(self: *App, surface: *Surface) void {
+        surface.deinit();
+        self.core_app.alloc.destroy(surface);
+    }
+    pub fn redrawInspector(self: *App, surface: *Surface) void {
+        _ = self;
+        surface.queueInspectorRender();
+    }
+    pub fn performAction(
+        self: *App,
+        target: apprt.Target,
+        comptime action: apprt.Action.Key,
+        value: apprt.Action.Value(action),
+    ) !bool {
+        self.performPreAction(target, action, value);
+        log.debug("dispatching action target={t} action={} value={any}", .{
+            target,
+            action,
+            value,
+        });
+        return self.opts.action(
+            self,
+            target.cval(),
+            @unionInit(apprt.Action, @tagName(action), value).cval(),
+        );
+    }
+    fn performPreAction(
+        self: *App,
+        target: apprt.Target,
+        comptime action: apprt.Action.Key,
+        value: apprt.Action.Value(action),
+    ) void {
+        switch (action) {
+            .set_title => switch (target) {
+                .app => {},
+                .surface => |surface| {
+                    const alloc = self.core_app.alloc;
+                    if (surface.rt_surface.title) |v| alloc.free(v);
+                    surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                },
+            },
+            .config_change => switch (target) {
+                .surface => {},
+                .app => if (value.config.clone(self.core_app.alloc)) |config| {
+                    self.config.deinit();
+                    self.config = config;
+                } else |err| {
+                    log.err("error updating app config err={}", .{err});
+                },
+            },
+            else => {},
+        }
+    }
+    pub fn performIpc(
+        _: Allocator,
+        _: apprt.ipc.Target,
+        comptime action: apprt.ipc.Action.Key,
+        _: apprt.ipc.Action.Value(action),
+    ) (Allocator.Error || apprt.ipc.Errors)!bool {
+        switch (action) {
+            .new_window => return false,
+            .new_tab => return false,
+            .toggle_quick_terminal => return false,
+        }
+    }
+};
+pub const Platform = union(PlatformTag) {
+    macos: MacOS,
+    ios: IOS,
+    pub const MacOS = if (builtin.target.os.tag.isDarwin()) struct {
+        nsview: objc.Object,
+    } else void;
+    pub const IOS = if (builtin.target.os.tag.isDarwin()) struct {
+        uiview: objc.Object,
+    } else void;
+    pub const C = extern union {
+        macos: extern struct {
+            nsview: ?*anyopaque,
+        },
+        ios: extern struct {
+            uiview: ?*anyopaque,
+        },
+    };
+    pub fn init(tag_int: c_int, c_platform: C) !Platform {
+        const tag = std.enums.fromInt(PlatformTag, tag_int) orelse return error.InvalidEnumTag;
+        return switch (tag) {
+            .macos => if (MacOS != void) macos: {
+                const config = c_platform.macos;
+                const nsview = objc.Object.fromId(config.nsview orelse
+                    break :macos error.NSViewMustBeSet);
+                break :macos .{ .macos = .{ .nsview = nsview } };
+            } else error.UnsupportedPlatform,
+            .ios => if (IOS != void) ios: {
+                const config = c_platform.ios;
+                const uiview = objc.Object.fromId(config.uiview orelse
+                    break :ios error.UIViewMustBeSet);
+                break :ios .{ .ios = .{ .uiview = uiview } };
+            } else error.UnsupportedPlatform,
+        };
+    }
+};
+pub const PlatformTag = enum(c_int) {
+    macos = 1,
+    ios = 2,
+};
+pub const EnvVar = extern struct {
+    key: [*:0]const u8,
+    value: [*:0]const u8,
+};
+pub const Surface = struct {
+    app: *App,
+    platform: Platform,
+    userdata: ?*anyopaque = null,
+    core_surface: CoreSurface,
+    content_scale: apprt.ContentScale,
+    size: apprt.SurfaceSize,
+    cursor_pos: apprt.CursorPos,
+    inspector: ?*Inspector = null,
+    title: ?[:0]const u8 = null,
+    pub const Options = extern struct {
+        platform_tag: c_int = 0,
+        platform: Platform.C = undefined,
+        userdata: ?*anyopaque = null,
+        scale_factor: f64 = 1,
+        font_size: f32 = 0,
+        working_directory: ?[*:0]const u8 = null,
+        command: ?[*:0]const u8 = null,
+        env_vars: ?[*]EnvVar = null,
+        env_var_count: usize = 0,
+        initial_input: ?[*:0]const u8 = null,
+        wait_after_command: bool = false,
+        context: apprt.surface.NewSurfaceContext = .window,
+    };
+    pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        self.* = .{
+            .app = app,
+            .platform = try .init(opts.platform_tag, opts.platform),
+            .userdata = opts.userdata,
+            .core_surface = undefined,
+            .content_scale = .{
+                .x = @floatCast(opts.scale_factor),
+                .y = @floatCast(opts.scale_factor),
+            },
+            .size = .{ .width = 800, .height = 600 },
+            .cursor_pos = .{ .x = -1, .y = -1 },
+        };
+        try app.core_app.addSurface(self);
+        errdefer app.core_app.deleteSurface(self);
+        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
+        defer config.deinit();
+        if (opts.working_directory) |c_wd| {
+            const wd = std.mem.sliceTo(c_wd, 0);
+            if (wd.len > 0) wd: {
+                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
+                    log.warn(
+                        "error opening requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
+                defer dir.close(global.io());
+                const stat = dir.stat(global.io()) catch |err| {
+                    log.warn(
+                        "failed to stat requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
+                if (stat.kind != .directory) {
+                    log.warn(
+                        "requested working directory is not a directory dir={s}",
+                        .{wd},
+                    );
+                    break :wd;
+                }
+                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
+                if (wd_val.finalize(config.arenaAlloc())) |_| {
+                    config.@"working-directory" = wd_val;
+                } else |err| {
+                    log.warn(
+                        "error finalizing working directory config dir={s} err={}",
+                        .{ wd_val.path, err },
+                    );
+                }
+            }
+        }
+        if (opts.command) |c_command| {
+            const cmd = std.mem.sliceTo(c_command, 0);
+            if (cmd.len > 0) {
+                config.command = .{ .shell = cmd };
+                config.@"wait-after-command" = true;
+            }
+        }
+        if (opts.env_var_count > 0) {
+            const alloc = config.arenaAlloc();
+            for (opts.env_vars.?[0..opts.env_var_count]) |env_var| {
+                const key = std.mem.sliceTo(env_var.key, 0);
+                const value = std.mem.sliceTo(env_var.value, 0);
+                try config.env.map.put(
+                    alloc,
+                    try alloc.dupeZ(u8, key),
+                    try alloc.dupeZ(u8, value),
+                );
+            }
+        }
+        if (opts.initial_input) |c_input| {
+            const alloc = config.arenaAlloc();
+            var buf: std.Io.Writer.Allocating = .init(alloc);
+            defer buf.deinit();
+            try std.zig.stringEscape(
+                std.mem.sliceTo(c_input, 0),
+                &buf.writer,
+            );
+            config.input.list.clearRetainingCapacity();
+            try config.input.list.append(
+                alloc,
+                .{ .raw = try buf.toOwnedSliceSentinel(0) },
+            );
+        }
+        if (opts.wait_after_command) {
+            config.@"wait-after-command" = true;
+        }
+        try self.core_surface.init(
+            app.core_app.alloc,
+            &config,
+            app.core_app,
+            app,
+            self,
+        );
+        errdefer self.core_surface.deinit();
+        if (opts.font_size != 0) {
+            var font_size = self.core_surface.font_size;
+            font_size.points = opts.font_size;
+            try self.core_surface.setFontSize(font_size);
+        }
+    }
+    pub fn deinit(self: *Surface) void {
+        self.freeInspector();
+        if (self.title) |v| self.app.core_app.alloc.free(v);
+        self.app.core_app.deleteSurface(self);
+        self.core_surface.deinit();
+    }
+    pub fn initInspector(self: *Surface) !*Inspector {
+        if (self.inspector) |v| return v;
+        const alloc = self.app.core_app.alloc;
+        const inspector = try alloc.create(Inspector);
+        errdefer alloc.destroy(inspector);
+        inspector.* = try .init(self);
+        self.inspector = inspector;
+        return inspector;
+    }
+    pub fn freeInspector(self: *Surface) void {
+        if (self.inspector) |v| {
+            v.deinit();
+            self.app.core_app.alloc.destroy(v);
+            self.inspector = null;
+        }
+    }
+    pub fn core(self: *Surface) *CoreSurface {
+        return &self.core_surface;
+    }
+    pub fn rtApp(self: *const Surface) *App {
+        return self.app;
+    }
+    pub fn close(self: *const Surface, process_alive: bool) void {
+        const func = self.app.opts.close_surface orelse {
+            log.info("runtime embedder does not support closing a surface", .{});
+            return;
+        };
+        func(self.userdata, process_alive);
+    }
+    pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
+        return self.content_scale;
+    }
+    pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
+        return self.size;
+    }
+    pub fn getTitle(self: *Surface) ?[:0]const u8 {
+        return self.title;
+    }
+    pub fn supportsClipboard(
+        self: *const Surface,
+        clipboard_type: apprt.Clipboard,
+    ) bool {
+        return switch (clipboard_type) {
+            .standard => true,
+            .selection => self.app.opts.supports_selection_clipboard,
+            .primary => false,
+        };
+    }
+    pub fn clipboardRequest(
+        self: *Surface,
+        clipboard_type: apprt.Clipboard,
+        state: apprt.ClipboardRequest,
+    ) !apprt.ClipboardReadResult {
+        if (state == .kitty_write) {
+            if (!self.supportsClipboard(clipboard_type)) return .unsupported;
+            const alloc = self.app.core_app.alloc;
+            const state_ptr = try alloc.create(apprt.ClipboardRequest);
+            errdefer alloc.destroy(state_ptr);
+            state_ptr.* = state;
+            self.completeKittyClipboardWrite(state_ptr);
+            return .started;
+        }
+        var mimes_buf: [terminal.kitty.clipboard.max_read_mimes][*:0]const u8 = undefined;
+        const mimes: []const [*:0]const u8 = switch (state) {
+            .paste, .osc_52_read => &.{"text/plain"},
+            .list => &.{},
+            .kitty_read => |kitty| mimes: {
+                assert(kitty.mimes.len <= mimes_buf.len);
+                for (kitty.mimes, mimes_buf[0..kitty.mimes.len]) |mime, *dst| {
+                    dst.* = if (terminal.clipboard.isTextMime(mime))
+                        "text/plain"
+                    else
+                        mime.ptr;
+                }
+                break :mimes mimes_buf[0..kitty.mimes.len];
+            },
+            .kitty_write => unreachable,
+            .osc_52_write => unreachable,
+        };
+        const list = switch (state) {
+            .list => true,
+            .kitty_read => |kitty| kitty.list,
+            else => false,
+        };
+        const alloc = self.app.core_app.alloc;
+        const state_ptr = try alloc.create(apprt.ClipboardRequest);
+        errdefer alloc.destroy(state_ptr);
+        state_ptr.* = state;
+        const result = self.app.opts.read_clipboard(
+            self.userdata,
+            @intCast(@intFromEnum(clipboard_type)),
+            state_ptr,
+            mimes.ptr,
+            mimes.len,
+            list,
+        );
+        if (result != .started) alloc.destroy(state_ptr);
+        return result;
+    }
+    fn completeKittyClipboardWrite(
+        self: *Surface,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+        const kitty = state.kitty_write;
+        self.core_surface.completeClipboardRequest(
+            state.*,
+            .{},
+        ) catch |err| switch (err) {
+            error.UnauthorizedPaste => {
+                var stack = std.heap.stackFallback(1024, alloc);
+                const conv_alloc = stack.get();
+                const contents = conv_alloc.alloc(
+                    CAPI.ClipboardContent,
+                    kitty.contents.len,
+                ) catch |alloc_err| {
+                    log.err("error confirming clipboard request err={}", .{alloc_err});
+                    self.core_surface.denyClipboardRequest(state.*);
+                    alloc.destroy(state);
+                    return;
+                };
+                defer conv_alloc.free(contents);
+                for (kitty.contents, contents) |src, *dst| dst.* = .{
+                    .mime = src.mime,
+                    .data = src.data.ptr,
+                    .len = src.data.len,
+                };
+                self.app.opts.confirm_read_clipboard(
+                    self.userdata,
+                    &.{
+                        .contents = contents.ptr,
+                        .contents_len = contents.len,
+                        .available = null,
+                        .available_len = 0,
+                        .name = if (kitty.name.len > 0) kitty.name.ptr else null,
+                        .can_remember = kitty.pw.len > 0,
+                    },
+                    state,
+                    state.*,
+                );
+                return;
+            },
+            else => log.err("error completing clipboard request err={}", .{err}),
+        };
+        alloc.destroy(state);
+    }
+    fn completeClipboardRequest(
+        self: *Surface,
+        complete: *const CAPI.ClipboardComplete,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+        var stack = std.heap.stackFallback(1024, alloc);
+        const conv_alloc = stack.get();
+        const raw_contents: []const CAPI.ClipboardContent =
+            if (complete.contents) |v| v[0..complete.contents_len] else &.{};
+        const contents = conv_alloc.alloc(
+            terminal.clipboard.Content,
+            raw_contents.len,
+        ) catch |err| {
+            log.err("error completing clipboard request err={}", .{err});
+            alloc.destroy(state);
+            return;
+        };
+        defer conv_alloc.free(contents);
+        for (raw_contents, contents) |raw, *content| content.* = .{
+            .mime = std.mem.sliceTo(raw.mime, 0),
+            .data = raw.data[0..raw.len],
+        };
+        const raw_available: []const [*:0]const u8 =
+            if (complete.available) |v| v[0..complete.available_len] else &.{};
+        const available = conv_alloc.alloc(
+            []const u8,
+            raw_available.len,
+        ) catch |err| {
+            log.err("error completing clipboard request err={}", .{err});
+            alloc.destroy(state);
+            return;
+        };
+        defer conv_alloc.free(available);
+        for (raw_available, available) |raw, *mime| {
+            mime.* = std.mem.sliceTo(raw, 0);
+        }
+        self.core_surface.completeClipboardRequest(state.*, .{
+            .contents = contents,
+            .available = available,
+            .confirmed = complete.confirmed,
+            .remember = complete.remember,
+        }) catch |err| switch (err) {
+            error.UnsafePaste,
+            error.UnauthorizedPaste,
+            => {
+                const name: ?[*:0]const u8, const can_remember: bool = switch (state.*) {
+                    inline .kitty_read, .kitty_write => |kitty| .{
+                        if (kitty.name.len > 0) kitty.name.ptr else null,
+                        kitty.pw.len > 0,
+                    },
+                    else => .{ null, false },
+                };
+                self.app.opts.confirm_read_clipboard(
+                    self.userdata,
+                    &.{
+                        .contents = complete.contents,
+                        .contents_len = complete.contents_len,
+                        .available = complete.available,
+                        .available_len = complete.available_len,
+                        .name = name,
+                        .can_remember = can_remember,
+                    },
+                    state,
+                    state.*,
+                );
+                return;
+            },
+            else => log.err("error completing clipboard request err={}", .{err}),
+        };
+        alloc.destroy(state);
+    }
+    fn denyClipboardRequest(
+        self: *Surface,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        self.core_surface.denyClipboardRequest(state.*);
+        self.app.core_app.alloc.destroy(state);
+    }
+    pub fn setClipboard(
+        self: *const Surface,
+        clipboard_type: apprt.Clipboard,
+        contents: []const apprt.ClipboardContent,
+        confirm: bool,
+    ) !void {
+        const alloc = self.app.core_app.alloc;
+        const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
+        defer alloc.free(array);
+        for (contents, 0..) |content, i| {
+            array[i] = .{
+                .mime = content.mime,
+                .data = content.data.ptr,
+                .len = content.data.len,
+            };
+        }
+        self.app.opts.write_clipboard(
+            self.userdata,
+            @intCast(@intFromEnum(clipboard_type)),
+            array.ptr,
+            array.len,
+            confirm,
+        );
+    }
+    pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
+        return self.cursor_pos;
+    }
+    pub fn refresh(self: *Surface) void {
+        self.core_surface.refreshCallback() catch |err| {
+            log.err("error in refresh callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn draw(self: *Surface) void {
+        self.core_surface.draw() catch |err| {
+            log.err("error in draw err={}", .{err});
+            return;
+        };
+    }
+    pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
+        const x_scaled = @max(1, if (std.math.isNan(x)) 1 else x);
+        const y_scaled = @max(1, if (std.math.isNan(y)) 1 else y);
+        self.content_scale = .{
+            .x = @floatCast(x_scaled),
+            .y = @floatCast(y_scaled),
+        };
+        self.core_surface.contentScaleCallback(self.content_scale) catch |err| {
+            log.err("error in content scale callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn updateSize(self: *Surface, width: u32, height: u32) void {
+        if (self.size.width == width and self.size.height == height) return;
+        self.size = .{
+            .width = width,
+            .height = height,
+        };
+        self.core_surface.sizeCallback(self.size) catch |err| {
+            log.err("error in size callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
+        self.core_surface.colorSchemeCallback(scheme) catch |err| {
+            log.err("error setting color scheme err={}", .{err});
+            return;
+        };
+    }
+    pub fn mouseButtonCallback(
+        self: *Surface,
+        action: input.MouseButtonState,
+        button: input.MouseButton,
+        mods: input.Mods,
+    ) bool {
+        return self.core_surface.mouseButtonCallback(action, button, mods) catch |err| {
+            log.err("error in mouse button callback err={}", .{err});
+            return false;
+        };
+    }
+    pub fn mousePressureCallback(
+        self: *Surface,
+        stage: input.MousePressureStage,
+        pressure: f64,
+    ) void {
+        self.core_surface.mousePressureCallback(stage, pressure) catch |err| {
+            log.err("error in mouse pressure callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn scrollCallback(
+        self: *Surface,
+        xoff: f64,
+        yoff: f64,
+        mods: input.ScrollMods,
+    ) void {
+        self.core_surface.scrollCallback(xoff, yoff, mods) catch |err| {
+            log.err("error in scroll callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn cursorPosCallback(
+        self: *Surface,
+        x: f64,
+        y: f64,
+        mods: input.Mods,
+    ) void {
+        const pos = self.cursorPosToPixels(.{
+            .x = @floatCast(x),
+            .y = @floatCast(y),
+        }) catch |err| {
+            log.err(
+                "error converting cursor pos to scaled pixels in cursor pos callback err={}",
+                .{err},
+            );
+            return;
+        };
+        if (@abs(self.cursor_pos.x - pos.x) < 1 and
+            @abs(self.cursor_pos.y - pos.y) < 1) return;
+        self.cursor_pos = pos;
+        self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
+            log.err("error in cursor pos callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) void {
+        _ = self.core_surface.preeditCallback(preedit_) catch |err| {
+            log.err("error in preedit callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn textCallback(self: *Surface, text: []const u8) void {
+        _ = self.core_surface.textCallback(text) catch |err| {
+            log.err("error in key callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn pasteText(self: *Surface, text: [:0]const u8) void {
+        if (text.len == 0) return;
+        const alloc = self.app.core_app.alloc;
+        const state = alloc.create(apprt.ClipboardRequest) catch |err| {
+            log.err("error allocating paste request err={}", .{err});
+            return;
+        };
+        state.* = .{ .paste = .standard };
+        const contents = [_]CAPI.ClipboardContent{.{
+            .mime = "text/plain",
+            .data = text.ptr,
+            .len = text.len,
+        }};
+        self.completeClipboardRequest(&.{
+            .contents = &contents,
+            .contents_len = contents.len,
+            .available = null,
+            .available_len = 0,
+            .confirmed = false,
+            .remember = false,
+        }, state);
+    }
+    pub fn focusCallback(self: *Surface, focused: bool) void {
+        self.core_surface.focusCallback(focused) catch |err| {
+            log.err("error in focus callback err={}", .{err});
+            return;
+        };
+    }
+    pub fn occlusionCallback(self: *Surface, visible: bool) void {
+        self.core_surface.occlusionCallback(visible) catch |err| {
+            log.err("error in occlusion callback err={}", .{err});
+            return;
+        };
+    }
+    fn queueInspectorRender(self: *Surface) void {
+        _ = self.app.performAction(
+            .{ .surface = &self.core_surface },
+            .render_inspector,
+            {},
+        ) catch |err| {
+            log.err("error rendering the inspector err={}", .{err});
+            return;
+        };
+    }
+    pub fn newSurfaceOptions(self: *const Surface, context: apprt.surface.NewSurfaceContext) apprt.Surface.Options {
+        const font_size: f32 = font_size: {
+            if (!self.app.config.@"window-inherit-font-size") break :font_size 0;
+            break :font_size self.core_surface.font_size.points;
+        };
+        const working_directory: ?[*:0]const u8 = wd: {
+            if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
+            const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
+            defer self.app.core_app.alloc.free(cwd);
+            break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
+        };
+        return .{
+            .font_size = font_size,
+            .working_directory = working_directory,
+            .context = context,
+        };
+    }
+    pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+        _ = self;
+        var env = try global.environMap();
+        errdefer env.deinit();
+        if (comptime builtin.target.os.tag.isDarwin()) {
+            if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
+                _ = env.orderedRemove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
+                _ = env.orderedRemove("__XPC_DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("DYLD_FRAMEWORK_PATH");
+                _ = env.orderedRemove("DYLD_INSERT_LIBRARIES");
+                _ = env.orderedRemove("DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("LD_LIBRARY_PATH");
+                _ = env.orderedRemove("SECURITYSESSIONID");
+                _ = env.orderedRemove("XPC_SERVICE_NAME");
+            }
+            _ = env.orderedRemove("WASP_MAC_LAUNCH_SOURCE");
+            if (internal_os.launchedFromDesktop()) _ = env.orderedRemove("LANGUAGE");
+        }
+        return env;
+    }
+    fn cursorPosToPixels(self: *const Surface, pos: apprt.CursorPos) !apprt.CursorPos {
+        const scale = try self.getContentScale();
+        return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
+    }
+    pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
+        _ = self;
+        return .{};
+    }
+};
+pub const Inspector = struct {
+    const cimgui = @import("dcimgui");
+    surface: *Surface,
+    ig_ctx: *cimgui.c.ImGuiContext,
+    backend: ?Backend = null,
+    content_scale: f64 = 1,
+    instant: ?std.Io.Timestamp = null,
+    const Backend = enum {
+        metal,
+        pub fn deinit(self: Backend) void {
+            switch (self) {
+                .metal => if (builtin.target.os.tag.isDarwin()) cimgui.ImGui_ImplMetal_Shutdown(),
+            }
+        }
+    };
+    pub fn init(surface: *Surface) !Inspector {
+        const ig_ctx = cimgui.c.ImGui_CreateContext(null) orelse return error.OutOfMemory;
+        errdefer cimgui.c.ImGui_DestroyContext(ig_ctx);
+        cimgui.c.ImGui_SetCurrentContext(ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        io.BackendPlatformName = "wasp_embedded";
+        CoreInspector.setup();
+        surface.core_surface.activateInspector() catch |err| {
+            log.err("failed to activate inspector err={}", .{err});
+        };
+        return .{
+            .surface = surface,
+            .ig_ctx = ig_ctx,
+        };
+    }
+    pub fn deinit(self: *Inspector) void {
+        self.surface.core_surface.deactivateInspector();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        if (self.backend) |v| v.deinit();
+        cimgui.c.ImGui_DestroyContext(self.ig_ctx);
+    }
+    pub fn queueRender(self: *Inspector) void {
+        self.surface.queueInspectorRender();
+    }
+    pub fn initMetal(self: *Inspector, device: objc.Object) bool {
+        defer device.msgSend(void, objc.sel("release"), .{});
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        if (self.backend) |v| {
+            v.deinit();
+            self.backend = null;
+        }
+        if (!cimgui.ImGui_ImplMetal_Init(device.value)) {
+            log.warn("failed to initialize metal backend", .{});
+            return false;
+        }
+        self.backend = .metal;
+        log.debug("initialized metal backend", .{});
+        return true;
+    }
+    pub fn renderMetal(
+        self: *Inspector,
+        command_buffer: objc.Object,
+        desc: objc.Object,
+    ) !void {
+        defer {
+            command_buffer.msgSend(void, objc.sel("release"), .{});
+            desc.msgSend(void, objc.sel("release"), .{});
+        }
+        assert(self.backend == .metal);
+        for (0..2) |_| {
+            cimgui.ImGui_ImplMetal_NewFrame(desc.value);
+            try self.newFrame();
+            cimgui.c.ImGui_NewFrame();
+            render: {
+                const surface = &self.surface.core_surface;
+                const inspector = surface.inspector orelse break :render;
+                inspector.render(surface);
+            }
+            cimgui.c.ImGui_Render();
+        }
+        const encoder = command_buffer.msgSend(
+            objc.Object,
+            objc.sel("renderCommandEncoderWithDescriptor:"),
+            .{desc.value},
+        );
+        defer encoder.msgSend(void, objc.sel("endEncoding"), .{});
+        cimgui.ImGui_ImplMetal_RenderDrawData(
+            cimgui.c.ImGui_GetDrawData(),
+            command_buffer.value,
+            encoder.value,
+        );
+    }
+    pub fn updateContentScale(self: *Inspector, x: f64, y: f64) void {
+        _ = y;
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        self.content_scale = x;
+        var style: cimgui.c.ImGuiStyle = undefined;
+        cimgui.ext.ImGuiStyle_ImGuiStyle(&style);
+        cimgui.c.ImGuiStyle_ScaleAllSizes(&style, @floatCast(x));
+        const active_style = cimgui.c.ImGui_GetStyle();
+        active_style.* = style;
+    }
+    pub fn updateSize(self: *Inspector, width: u32, height: u32) void {
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        io.DisplaySize = .{ .x = @floatFromInt(width), .y = @floatFromInt(height) };
+    }
+    pub fn mouseButtonCallback(
+        self: *Inspector,
+        action: input.MouseButtonState,
+        button: input.MouseButton,
+        mods: input.Mods,
+    ) void {
+        _ = mods;
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        const imgui_button = switch (button) {
+            .left => cimgui.c.ImGuiMouseButton_Left,
+            .middle => cimgui.c.ImGuiMouseButton_Middle,
+            .right => cimgui.c.ImGuiMouseButton_Right,
+            else => return,
+        };
+        cimgui.c.ImGuiIO_AddMouseButtonEvent(io, imgui_button, action == .press);
+    }
+    pub fn scrollCallback(
+        self: *Inspector,
+        xoff: f64,
+        yoff: f64,
+        mods: input.ScrollMods,
+    ) void {
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        const scale: f64 = if (mods.precision) 0.1 else 1.0;
+        cimgui.c.ImGuiIO_AddMouseWheelEvent(
+            io,
+            @floatCast(xoff * scale),
+            @floatCast(yoff * scale),
+        );
+    }
+    pub fn cursorPosCallback(self: *Inspector, x: f64, y: f64) void {
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        cimgui.c.ImGuiIO_AddMousePosEvent(
+            io,
+            @floatCast(x * self.content_scale),
+            @floatCast(y * self.content_scale),
+        );
+    }
+    pub fn focusCallback(self: *Inspector, focused: bool) void {
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        cimgui.c.ImGuiIO_AddFocusEvent(io, focused);
+    }
+    pub fn textCallback(self: *Inspector, text: [:0]const u8) void {
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        cimgui.c.ImGuiIO_AddInputCharactersUTF8(io, text.ptr);
+    }
+    pub fn keyCallback(
+        self: *Inspector,
+        action: input.Action,
+        key: input.Key,
+        mods: input.Mods,
+    ) !void {
+        self.queueRender();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftShift, mods.shift);
+        cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftCtrl, mods.ctrl);
+        cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftAlt, mods.alt);
+        cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftSuper, mods.super);
+        if (key.imguiKey()) |imgui_key| {
+            cimgui.c.ImGuiIO_AddKeyEvent(
+                io,
+                imgui_key,
+                action == .press or action == .repeat,
+            );
+        }
+    }
+    fn newFrame(self: *Inspector) !void {
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        const now: std.Io.Timestamp = .now(global.io(), .awake);
+        io.DeltaTime = if (self.instant) |prev| delta: {
+            const since_ns: f64 = @floatFromInt(prev.durationTo(now).toNanoseconds());
+            const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
+            const since_s: f32 = @floatCast(since_ns / ns_per_s);
+            break :delta @max(0.00001, since_s);
+        } else (1.0 / 60.0);
+        self.instant = now;
+    }
+};
+pub const CAPI = struct {
+    const KeyEvent = extern struct {
+        action: input.Action,
+        mods: c_int,
+        consumed_mods: c_int,
+        keycode: u32,
+        text: ?[*:0]const u8,
+        unshifted_codepoint: u32,
+        composing: bool,
+        fn keyEvent(self: KeyEvent) App.KeyEvent {
+            return .{
+                .action = self.action,
+                .mods = @bitCast(@as(
+                    input.Mods.Backing,
+                    @truncate(@as(c_uint, @bitCast(self.mods))),
+                )),
+                .consumed_mods = @bitCast(@as(
+                    input.Mods.Backing,
+                    @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+                )),
+                .keycode = self.keycode,
+                .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
+                .unshifted_codepoint = self.unshifted_codepoint,
+                .composing = self.composing,
+            };
+        }
+    };
+    const SurfaceSize = extern struct {
+        columns: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    };
+    const ClipboardContent = extern struct {
+        mime: [*:0]const u8,
+        data: [*]const u8,
+        len: usize,
+    };
+    const ClipboardComplete = extern struct {
+        contents: ?[*]const ClipboardContent,
+        contents_len: usize,
+        available: ?[*]const [*:0]const u8,
+        available_len: usize,
+        confirmed: bool,
+        remember: bool,
+    };
+    const ClipboardConfirm = extern struct {
+        contents: ?[*]const ClipboardContent,
+        contents_len: usize,
+        available: ?[*]const [*:0]const u8,
+        available_len: usize,
+        name: ?[*:0]const u8,
+        can_remember: bool,
+    };
+    const Text = extern struct {
+        tl_px_x: f64,
+        tl_px_y: f64,
+        offset_start: u32,
+        offset_len: u32,
+        text: ?[*:0]const u8,
+        text_len: usize,
+        pub fn deinit(self: *Text) void {
+            if (self.text) |ptr| {
+                global.alloc().free(ptr[0..self.text_len :0]);
+            }
+        }
+    };
+    const Point = extern struct {
+        tag: Tag,
+        coord_tag: CoordTag,
+        x: u32,
+        y: u32,
+        const Tag = enum(c_int) {
+            active = 0,
+            viewport = 1,
+            screen = 2,
+            history = 3,
+        };
+        const CoordTag = enum(c_int) {
+            exact = 0,
+            top_left = 1,
+            bottom_right = 2,
+        };
+        fn pin(
+            self: Point,
+            screen: *const terminal.Screen,
+        ) ?terminal.Pin {
+            const tag: terminal.point.Tag = switch (self.tag) {
+                inline else => |tag| @field(
+                    terminal.point.Tag,
+                    @tagName(tag),
+                ),
+            };
+            const clamped_x = @min(self.x, screen.pages.cols -| 1);
+            const clamped_y = @min(self.y, screen.pages.rows -| 1);
+            return switch (self.coord_tag) {
+                .exact => exact: {
+                    const pt_x = std.math.cast(
+                        terminal.size.CellCountInt,
+                        clamped_x,
+                    ) orelse std.math.maxInt(terminal.size.CellCountInt);
+                    const pt: terminal.Point = switch (tag) {
+                        inline else => |v| @unionInit(
+                            terminal.Point,
+                            @tagName(v),
+                            .{ .x = pt_x, .y = clamped_y },
+                        ),
+                    };
+                    break :exact screen.pages.pin(pt) orelse null;
+                },
+                .top_left => screen.pages.getTopLeft(tag),
+                .bottom_right => screen.pages.getBottomRight(tag),
+            };
+        }
+    };
+    const Selection = extern struct {
+        tl: Point,
+        br: Point,
+        rectangle: bool,
+        fn core(
+            self: Selection,
+            screen: *const terminal.Screen,
+        ) ?terminal.Selection {
+            return .{
+                .bounds = .{ .untracked = .{
+                    .start = self.tl.pin(screen) orelse return null,
+                    .end = self.br.pin(screen) orelse return null,
+                } },
+                .rectangle = self.rectangle,
+            };
+        }
+    };
+    comptime {
+        if (builtin.target.os.tag.isDarwin()) {
+            _ = Darwin;
+        }
+    }
+    export fn wasp_app_new(
+        opts: *const apprt.runtime.App.Options,
+        config: *const Config,
+    ) ?*App {
+        return app_new_(opts, config) catch |err| {
+            log.err("error initializing app err={}", .{err});
+            return null;
+        };
+    }
+    fn app_new_(
+        opts: *const apprt.runtime.App.Options,
+        config: *const Config,
+    ) !*App {
+        const core_app = try CoreApp.create(global.alloc());
+        errdefer core_app.destroy();
+        var app = try global.alloc().create(App);
+        errdefer global.alloc().destroy(app);
+        try app.init(core_app, config, opts.*);
+        errdefer app.terminate();
+        return app;
+    }
+    export fn wasp_app_tick(v: *App) void {
+        v.core_app.tick(v) catch |err| {
+            log.err("error app tick err={}", .{err});
+        };
+    }
+    export fn wasp_app_userdata(v: *App) ?*anyopaque {
+        return v.opts.userdata;
+    }
+    export fn wasp_app_free(v: *App) void {
+        const core_app = v.core_app;
+        v.terminate();
+        global.alloc().destroy(v);
+        core_app.destroy();
+    }
+    export fn wasp_app_set_focus(
+        app: *App,
+        focused: bool,
+    ) void {
+        app.focusEvent(focused);
+    }
+    export fn wasp_app_key(
+        app: *App,
+        event: KeyEvent,
+    ) bool {
+        return app.keyEvent(.app, event.keyEvent()) catch |err| {
+            log.warn("error processing key event err={}", .{err});
+            return false;
+        };
+    }
+    export fn wasp_config_key_is_binding(
+        config: *Config,
+        event: KeyEvent,
+    ) bool {
+        const core_event = event.keyEvent().core() orelse {
+            log.warn("error processing key event", .{});
+            return false;
+        };
+        return config.keyEventIsBinding(core_event);
+    }
+    export fn wasp_app_keyboard_changed(v: *App) void {
+        v.reloadKeymap() catch |err| {
+            log.err("error reloading keyboard map err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_app_open_config(v: *App) void {
+        _ = v.performAction(.app, .open_config, .new_window) catch |err| {
+            log.err("error reloading config err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_app_update_config(
+        v: *App,
+        config: *const Config,
+    ) void {
+        v.core_app.updateConfig(v, config) catch |err| {
+            log.err("error updating config err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_app_needs_confirm_quit(v: *App) bool {
+        return v.core_app.needsConfirmQuit();
+    }
+    export fn wasp_app_has_global_keybinds(v: *App) bool {
+        return v.hasGlobalKeybinds();
+    }
+    export fn wasp_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
+        v.core_app.colorSchemeEvent(v, scheme) catch |err| {
+            log.err("error setting color scheme err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_config_new() apprt.Surface.Options {
+        return .{};
+    }
+    export fn wasp_surface_new(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+    ) ?*Surface {
+        return surface_new_(app, opts) catch |err| {
+            log.err("error initializing surface err={}", .{err});
+            return null;
+        };
+    }
+    fn surface_new_(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+    ) !*Surface {
+        return try app.newSurface(opts.*);
+    }
+    export fn wasp_surface_free(ptr: *Surface) void {
+        ptr.app.closeSurface(ptr);
+    }
+    export fn wasp_surface_userdata(surface: *Surface) ?*anyopaque {
+        return surface.userdata;
+    }
+    export fn wasp_surface_app(surface: *Surface) *App {
+        return surface.app;
+    }
+    export fn wasp_surface_inherited_config(
+        surface: *Surface,
+        source: apprt.surface.NewSurfaceContext,
+    ) Surface.Options {
+        return surface.newSurfaceOptions(source);
+    }
+    export fn wasp_surface_update_config(
+        surface: *Surface,
+        config: *const Config,
+    ) void {
+        surface.core_surface.updateConfig(config) catch |err| {
+            log.err("error updating config err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_needs_confirm_quit(surface: *Surface) bool {
+        return surface.core_surface.needsConfirmQuit();
+    }
+    export fn wasp_surface_process_exited(surface: *Surface) bool {
+        return surface.core_surface.child_exited;
+    }
+    export fn wasp_surface_has_selection(surface: *Surface) bool {
+        return surface.core_surface.hasSelection();
+    }
+    export fn wasp_surface_read_selection(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
+        return readTextLocked(surface, core_sel, result);
+    }
+    export fn wasp_surface_read_text(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        const core_sel = sel.core(
+            surface.core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+        return readTextLocked(surface, core_sel, result);
+    }
+    fn readTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const text = core_surface.dumpTextLocked(
+            global.alloc(),
+            core_sel,
+        ) catch |err| {
+            log.warn("error reading text err={}", .{err});
+            return false;
+        };
+        const vp: CoreSurface.Text.Viewport = text.viewport orelse .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+        };
+        result.* = .{
+            .tl_px_x = vp.tl_px_x,
+            .tl_px_y = vp.tl_px_y,
+            .offset_start = vp.offset_start,
+            .offset_len = vp.offset_len,
+            .text = text.text.ptr,
+            .text_len = text.text.len,
+        };
+        return true;
+    }
+    export fn wasp_surface_free_text(_: *Surface, ptr: *Text) void {
+        ptr.deinit();
+    }
+    export fn wasp_surface_refresh(surface: *Surface) void {
+        surface.refresh();
+    }
+    export fn wasp_surface_draw(surface: *Surface) void {
+        surface.draw();
+    }
+    export fn wasp_surface_set_size(surface: *Surface, w: u32, h: u32) void {
+        surface.updateSize(w, h);
+    }
+    export fn wasp_surface_size(surface: *Surface) SurfaceSize {
+        const grid_size = surface.core_surface.size.grid();
+        return .{
+            .columns = grid_size.columns,
+            .rows = grid_size.rows,
+            .width_px = surface.core_surface.size.screen.width,
+            .height_px = surface.core_surface.size.screen.height,
+            .cell_width_px = surface.core_surface.size.cell.width,
+            .cell_height_px = surface.core_surface.size.cell.height,
+        };
+    }
+    export fn wasp_surface_foreground_pid(surface: *Surface) u64 {
+        return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
+    }
+    export fn wasp_surface_tty_name(surface: *Surface) String {
+        const tty_name = surface.core_surface.getProcessInfo(.tty_name) orelse return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, tty_name) catch |err| {
+            log.err("error allocating tty name err={}", .{err});
+            return .empty;
+        };
+        return .fromSlice(copy);
+    }
+    export fn wasp_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
+        surface.colorSchemeCallback(scheme);
+    }
+    export fn wasp_surface_set_content_scale(surface: *Surface, x: f64, y: f64) void {
+        surface.updateContentScale(x, y);
+    }
+    export fn wasp_surface_set_focus(surface: *Surface, focused: bool) void {
+        surface.focusCallback(focused);
+    }
+    export fn wasp_surface_set_occlusion(surface: *Surface, visible: bool) void {
+        surface.occlusionCallback(visible);
+    }
+    export fn wasp_surface_key_translation_mods(
+        surface: *Surface,
+        mods_raw: c_int,
+    ) c_int {
+        const mods: input.Mods = @bitCast(@as(
+            input.Mods.Backing,
+            @truncate(@as(c_uint, @bitCast(mods_raw))),
+        ));
+        const result = mods.translation(
+            surface.core_surface.config.macos_option_as_alt orelse
+                surface.app.keyboardLayout().detectOptionAsAlt(),
+        );
+        return @intCast(@as(input.Mods.Backing, @bitCast(result)));
+    }
+    export fn wasp_surface_key(
+        surface: *Surface,
+        event: KeyEvent,
+    ) bool {
+        return surface.app.keyEvent(
+            .{ .surface = surface },
+            event.keyEvent(),
+        ) catch |err| {
+            log.warn("error processing key event err={}", .{err});
+            return false;
+        };
+    }
+    export fn wasp_surface_key_is_binding(
+        surface: *Surface,
+        event: KeyEvent,
+        c_flags: ?*input.Binding.Flags.C,
+    ) bool {
+        const core_event = event.keyEvent().core() orelse {
+            log.warn("error processing key event", .{});
+            return false;
+        };
+        const flags = surface.core_surface.keyEventIsBinding(
+            core_event,
+        ) orelse return false;
+        if (c_flags) |ptr| ptr.* = flags.cval();
+        return true;
+    }
+    export fn wasp_surface_text(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.textCallback(ptr[0..len]);
+    }
+    export fn wasp_surface_paste_text(
+        surface: *Surface,
+        ptr: [*:0]const u8,
+        len: usize,
+    ) void {
+        surface.pasteText(ptr[0..len :0]);
+    }
+    export fn wasp_surface_preedit(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+    export fn wasp_surface_mouse_captured(surface: *Surface) bool {
+        return surface.core_surface.mouseCaptured();
+    }
+    export fn wasp_surface_mouse_button(
+        surface: *Surface,
+        action: input.MouseButtonState,
+        button: input.MouseButton,
+        mods: c_int,
+    ) bool {
+        return surface.mouseButtonCallback(
+            action,
+            button,
+            @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(mods))),
+            )),
+        );
+    }
+    export fn wasp_surface_mouse_pos(
+        surface: *Surface,
+        x: f64,
+        y: f64,
+        mods: c_int,
+    ) void {
+        surface.cursorPosCallback(
+            x,
+            y,
+            @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(mods))),
+            )),
+        );
+    }
+    export fn wasp_surface_mouse_scroll(
+        surface: *Surface,
+        x: f64,
+        y: f64,
+        scroll_mods: c_int,
+    ) void {
+        surface.scrollCallback(
+            x,
+            y,
+            @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
+        );
+    }
+    export fn wasp_surface_mouse_pressure(
+        surface: *Surface,
+        stage_raw: u32,
+        pressure: f64,
+    ) void {
+        const stage = std.enums.fromInt(input.MousePressureStage, stage_raw) orelse return;
+        surface.mousePressureCallback(stage, pressure);
+    }
+    export fn wasp_surface_ime_point(
+        surface: *Surface,
+        x: *f64,
+        y: *f64,
+        width: *f64,
+        height: *f64,
+    ) void {
+        const pos = surface.core_surface.imePoint();
+        x.* = pos.x;
+        y.* = pos.y;
+        width.* = pos.width;
+        height.* = pos.height;
+    }
+    export fn wasp_surface_request_close(ptr: *Surface) void {
+        const handled = ptr.core_surface.performBindingAction(.{ .close_surface = {} }) catch |err| {
+            log.err("error requesting close err={}", .{err});
+            return;
+        };
+        if (!handled) ptr.core_surface.close();
+    }
+    export fn wasp_surface_split(ptr: *Surface, direction: apprt.action.SplitDirection) void {
+        const action: input.Binding.Action = .{
+            .new_split = switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+            },
+        };
+        _ = ptr.core_surface.performBindingAction(action) catch |err| {
+            log.err("error creating new split err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_split_focus(
+        ptr: *Surface,
+        direction: apprt.action.GotoSplit,
+    ) void {
+        const action: input.Binding.Action = .{
+            .goto_split = switch (direction) {
+                .previous => .previous,
+                .next => .next,
+                .up => .up,
+                .down => .down,
+                .left => .left,
+                .right => .right,
+            },
+        };
+        _ = ptr.core_surface.performBindingAction(action) catch |err| {
+            log.err("error focusing split err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_split_resize(
+        ptr: *Surface,
+        direction: apprt.action.ResizeSplit.Direction,
+        amount: u16,
+    ) void {
+        _ = ptr.app.performAction(
+            .{ .surface = &ptr.core_surface },
+            .resize_split,
+            .{ .direction = direction, .amount = amount },
+        ) catch |err| {
+            log.err("error resizing split err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_split_equalize(ptr: *Surface) void {
+        _ = ptr.app.performAction(
+            .{ .surface = &ptr.core_surface },
+            .equalize_splits,
+            {},
+        ) catch |err| {
+            log.err("error equalizing splits err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_surface_binding_action(
+        ptr: *Surface,
+        action_ptr: [*]const u8,
+        action_len: usize,
+    ) bool {
+        const action_str = action_ptr[0..action_len];
+        const action = input.Binding.Action.parse(action_str) catch |err| {
+            log.err("error parsing binding action action={s} err={}", .{ action_str, err });
+            return false;
+        };
+        return ptr.core_surface.performBindingAction(action) catch |err| {
+            log.err("error performing binding action action={f} err={}", .{ action, err });
+            return false;
+        };
+    }
+    export fn wasp_surface_complete_clipboard_request(
+        ptr: *Surface,
+        complete: *const ClipboardComplete,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        ptr.completeClipboardRequest(complete, state);
+    }
+    export fn wasp_surface_deny_clipboard_request(
+        ptr: *Surface,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        ptr.denyClipboardRequest(state);
+    }
+    export fn wasp_surface_inspector(ptr: *Surface) ?*Inspector {
+        return ptr.initInspector() catch |err| {
+            log.err("error initializing inspector err={}", .{err});
+            return null;
+        };
+    }
+    export fn wasp_inspector_free(ptr: *Surface) void {
+        ptr.freeInspector();
+    }
+    export fn wasp_inspector_set_size(ptr: *Inspector, w: u32, h: u32) void {
+        ptr.updateSize(w, h);
+    }
+    export fn wasp_inspector_set_content_scale(ptr: *Inspector, x: f64, y: f64) void {
+        ptr.updateContentScale(x, y);
+    }
+    export fn wasp_inspector_mouse_button(
+        ptr: *Inspector,
+        action: input.MouseButtonState,
+        button: input.MouseButton,
+        mods: c_int,
+    ) void {
+        ptr.mouseButtonCallback(
+            action,
+            button,
+            @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(mods))),
+            )),
+        );
+    }
+    export fn wasp_inspector_mouse_pos(ptr: *Inspector, x: f64, y: f64) void {
+        ptr.cursorPosCallback(x, y);
+    }
+    export fn wasp_inspector_mouse_scroll(
+        ptr: *Inspector,
+        x: f64,
+        y: f64,
+        scroll_mods: c_int,
+    ) void {
+        ptr.scrollCallback(
+            x,
+            y,
+            @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
+        );
+    }
+    export fn wasp_inspector_key(
+        ptr: *Inspector,
+        action: input.Action,
+        key: input.Key,
+        c_mods: c_int,
+    ) void {
+        ptr.keyCallback(
+            action,
+            key,
+            @bitCast(@as(
+                input.Mods.Backing,
+                @truncate(@as(c_uint, @bitCast(c_mods))),
+            )),
+        ) catch |err| {
+            log.err("error processing key event err={}", .{err});
+            return;
+        };
+    }
+    export fn wasp_inspector_text(
+        ptr: *Inspector,
+        str: [*:0]const u8,
+    ) void {
+        ptr.textCallback(std.mem.sliceTo(str, 0));
+    }
+    export fn wasp_inspector_set_focus(ptr: *Inspector, focused: bool) void {
+        ptr.focusCallback(focused);
+    }
+    export fn wasp_set_window_background_blur(
+        app: *App,
+        window: *anyopaque,
+    ) void {
+        if (comptime builtin.target.os.tag != .macos) return;
+        const config = &app.config;
+        if (config.@"background-opacity" >= 1.0) return;
+        const nswindow = objc.Object.fromId(window);
+        _ = CGSSetWindowBackgroundBlurRadius(
+            CGSDefaultConnectionForThread(),
+            nswindow.msgSend(usize, objc.sel("windowNumber"), .{}),
+            @intCast(config.@"background-blur".cval()),
+        );
+    }
+    extern "c" fn CGSSetWindowBackgroundBlurRadius(*anyopaque, usize, c_int) i32;
+    extern "c" fn CGSDefaultConnectionForThread() *anyopaque;
+    const Darwin = struct {
+        export fn wasp_surface_set_display_id(ptr: *Surface, display_id: u32) void {
+            const surface = &ptr.core_surface;
+            _ = surface.renderer_thread.mailbox.push(
+                global.io(),
+                .{ .macos_display_id = display_id },
+                .{ .forever = {} },
+            );
+            surface.renderer_thread.wakeup.notify() catch {};
+        }
+        export fn wasp_surface_quicklook_font(ptr: *Surface) ?*anyopaque {
+            if (comptime font.options.backend != .coretext) {
+                return null;
+            }
+            const content_scale = ptr.getContentScale() catch return null;
+            const grid = ptr.core_surface.renderer.font_grid;
+            grid.lock.lockSharedUncancelable(global.io());
+            defer grid.lock.unlockShared(global.io());
+            const collection = &grid.resolver.collection;
+            const face = collection.getFace(.{}) catch return null;
+            const size: f32 = size: {
+                const num = face.font.copyAttribute(.size) orelse
+                    break :size 12;
+                defer num.release();
+                var v: f32 = 12;
+                _ = num.getValue(.float, &v);
+                break :size v;
+            };
+            const copy = face.font.copyWithAttributes(
+                size / content_scale.y,
+                null,
+                null,
+            ) catch return null;
+            return copy;
+        }
+        export fn wasp_surface_quicklook_word(
+            ptr: *Surface,
+            result: *Text,
+        ) bool {
+            const surface = &ptr.core_surface;
+            surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer surface.renderer_state.mutex.unlock(global.io());
+            const sel = sel: {
+                const screen: *terminal.Screen = surface.renderer_state.terminal.screens.active;
+                const pos = try ptr.getCursorPos();
+                const pt_viewport = surface.posToViewport(pos.x, pos.y);
+                const pin = screen.pages.pin(.{
+                    .viewport = .{
+                        .x = pt_viewport.x,
+                        .y = pt_viewport.y,
+                    },
+                }) orelse {
+                    if (comptime std.debug.runtime_safety) unreachable;
+                    return false;
+                };
+                break :sel surface.io.terminal.screens.active.selectWord(
+                    pin,
+                    surface.config.selection_word_chars,
+                ) orelse return false;
+            };
+            return readTextLocked(ptr, sel, result);
+        }
+        export fn wasp_inspector_metal_init(ptr: *Inspector, device: objc.c.id) bool {
+            return ptr.initMetal(.fromId(device));
+        }
+        export fn wasp_inspector_metal_render(
+            ptr: *Inspector,
+            command_buffer: objc.c.id,
+            descriptor: objc.c.id,
+        ) void {
+            return ptr.renderMetal(
+                .fromId(command_buffer),
+                .fromId(descriptor),
+            ) catch |err| {
+                log.err("error rendering inspector err={}", .{err});
+                return;
+            };
+        }
+        export fn wasp_inspector_metal_shutdown(ptr: *Inspector) void {
+            if (ptr.backend) |v| {
+                v.deinit();
+                ptr.backend = null;
+            }
+        }
+    };
+};

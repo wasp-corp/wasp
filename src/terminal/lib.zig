@@ -1,0 +1,15 @@
+const std = @import("std");
+const build_options = @import("terminal_options");
+const lib = @import("../lib/main.zig");
+pub const target: lib.Target = if (build_options.c_abi) .c else .zig;
+pub const calling_conv: std.builtin.CallingConvention = .c;
+pub const alloc = lib.allocator;
+pub const StdIo = lib.StdIo;
+pub const Buffer = lib.Buffer;
+pub const Enum = lib.Enum;
+pub const parseInt = lib.parseInt;
+pub const TaggedUnion = lib.TaggedUnion;
+pub const Struct = lib.Struct;
+pub const String = lib.String;
+pub const checkWaspHEnum = lib.checkWaspHEnum;
+pub const structSizedFieldFits = lib.structSizedFieldFits;

@@ -1,0 +1,218 @@
+const StringMap = @This();
+const std = @import("std");
+const build_options = @import("terminal_options");
+const oni = @import("oniguruma");
+const point = @import("point.zig");
+const PinMap = @import("formatter.zig").PinMap;
+const Selection = @import("Selection.zig");
+const Screen = @import("Screen.zig");
+const Allocator = std.mem.Allocator;
+const oni_search_retry_limit = 100_000;
+string: [:0]const u8,
+map: PinMap.Map,
+pub fn deinit(self: StringMap, alloc: Allocator) void {
+    alloc.free(self.string);
+    var map = self.map;
+    map.deinit(alloc);
+}
+pub const searchIterator = if (build_options.oniguruma)
+    searchIteratorOni
+else
+    void;
+fn searchIteratorOni(
+    self: StringMap,
+    regex: oni.Regex,
+) SearchIterator {
+    return .{ .map = self, .regex = regex };
+}
+pub const SearchIterator = struct {
+    map: StringMap,
+    regex: oni.Regex,
+    offset: usize = 0,
+    pub fn next(self: *SearchIterator) !?Match {
+        if (self.offset >= self.map.string.len) return null;
+        var match_param = try oni.MatchParam.init();
+        defer match_param.deinit();
+        try match_param.setRetryLimitInSearch(oni_search_retry_limit);
+        var region = self.regex.searchWithParam(
+            self.map.string[self.offset..],
+            .{},
+            &match_param,
+        ) catch |err| switch (err) {
+            error.Mismatch,
+            error.RetryLimitInMatchOver,
+            error.RetryLimitInSearchOver,
+            error.MatchStackLimitOver,
+            error.SubexpCallLimitInSearchOver,
+            => {
+                self.offset = self.map.string.len;
+                return null;
+            },
+            else => return err,
+        };
+        errdefer region.deinit();
+        const end_idx: usize = @intCast(region.ends()[0]);
+        defer self.offset += end_idx;
+        return .{
+            .map = self.map,
+            .offset = self.offset,
+            .region = region,
+        };
+    }
+};
+pub const Match = struct {
+    map: StringMap,
+    offset: usize,
+    region: oni.Region,
+    pub fn deinit(self: *Match) void {
+        self.region.deinit();
+    }
+    pub fn selection(self: Match) Selection {
+        const start_idx: usize = @intCast(self.region.starts()[0]);
+        const end_idx: usize = @intCast(self.region.ends()[0] - 1);
+        const start_pt = self.map.map.get(self.offset + start_idx).?;
+        const end_pt = self.map.map.get(self.offset + end_idx).?;
+        return .init(start_pt, end_pt, false);
+    }
+};
+test "StringMap searchIterator" {
+    if (comptime !build_options.oniguruma) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(
+        "[A-B]{2}",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+    var s = try Screen.init(io, alloc, .{ .cols = 5, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    const str = "1ABCD2EFGH\n3IJKL";
+    try s.testWriteString(str);
+    const line = s.selectLine(.{
+        .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 1,
+        } }).?,
+    }).?;
+    const map = try s.selectionStringMap(alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer map.deinit(alloc);
+    var it = map.searchIterator(re);
+    {
+        var match = (try it.next()).?;
+        defer match.deinit();
+        const sel = match.selection();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 1,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.start()).?);
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 2,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+    try testing.expect(try it.next() == null);
+}
+test "StringMap searchIterator URL detection" {
+    if (comptime !build_options.oniguruma) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    const url = @import("../config/url.zig");
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(
+        url.regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+    var s = try Screen.init(io, alloc, .{ .cols = 40, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello https://example.com/path world");
+    const line = s.selectLine(.{
+        .pin = s.pages.pin(.{ .active = .{
+            .x = 10,
+            .y = 0,
+        } }).?,
+    }).?;
+    const map = try s.selectionStringMap(alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer map.deinit(alloc);
+    var it = map.searchIterator(re);
+    {
+        var match = (try it.next()).?;
+        defer match.deinit();
+        const sel = match.selection();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 6,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.start()).?);
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 29,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+    try testing.expect(try it.next() == null);
+}
+test "StringMap searchIterator URL with click position" {
+    if (comptime !build_options.oniguruma) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    const url = @import("../config/url.zig");
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(
+        url.regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+    var s = try Screen.init(io, alloc, .{ .cols = 40, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello https://example.com world");
+    const click_pin = s.pages.pin(.{ .active = .{
+        .x = 14,
+        .y = 0,
+    } }).?;
+    const line = s.selectLine(.{
+        .pin = click_pin,
+    }).?;
+    const map = try s.selectionStringMap(alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer map.deinit(alloc);
+    var it = map.searchIterator(re);
+    var found_url = false;
+    while (true) {
+        var match = (try it.next()) orelse break;
+        defer match.deinit();
+        const sel = match.selection();
+        if (sel.contains(&s, click_pin)) {
+            found_url = true;
+            try testing.expectEqual(point.Point{ .screen = .{
+                .x = 6,
+                .y = 0,
+            } }, s.pages.pointFromPin(.screen, sel.start()).?);
+            try testing.expectEqual(point.Point{ .screen = .{
+                .x = 24,
+                .y = 0,
+            } }, s.pages.pointFromPin(.screen, sel.end()).?);
+            break;
+        }
+    }
+    try testing.expect(found_url);
+}

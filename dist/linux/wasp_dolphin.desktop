@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=inode/directory
+Actions=RunWaspDir
+
+[Desktop Action RunWaspDir]
+Name=Open Wasp Here
+Icon=com.mitchellh.wasp
+Exec=wasp +new-window --working-directory=%F

@@ -1,0 +1,8 @@
+.zig-cache
+.zig-out
+.zig-pkg
+c.sh
+zig.sh
+pkg
+rename.sh
+build.zig.zon

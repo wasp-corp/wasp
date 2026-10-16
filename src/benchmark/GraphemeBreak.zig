@@ -1,0 +1,111 @@
+const GraphemeBreak = @This();
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Benchmark = @import("Benchmark.zig");
+const options = @import("options.zig");
+const UTF8Decoder = @import("../terminal/UTF8Decoder.zig");
+const unicode = @import("../unicode/root.zig");
+const uucode = @import("uucode");
+const global = @import("../global.zig");
+const log = std.log.scoped(.@"terminal-stream-bench");
+opts: Options,
+data_f: ?std.Io.File = null,
+pub const Options = struct {
+    mode: Mode = .table,
+    data: ?[]const u8 = null,
+};
+pub const Mode = enum {
+    noop,
+    table,
+};
+pub fn create(
+    alloc: Allocator,
+    opts: Options,
+) !*GraphemeBreak {
+    const ptr = try alloc.create(GraphemeBreak);
+    errdefer alloc.destroy(ptr);
+    ptr.* = .{ .opts = opts };
+    return ptr;
+}
+pub fn destroy(self: *GraphemeBreak, alloc: Allocator) void {
+    alloc.destroy(self);
+}
+pub fn benchmark(self: *GraphemeBreak) Benchmark {
+    return .init(self, .{
+        .stepFn = switch (self.opts.mode) {
+            .noop => stepNoop,
+            .table => stepTable,
+        },
+        .setupFn = setup,
+        .teardownFn = teardown,
+    });
+}
+fn setup(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *GraphemeBreak = @ptrCast(@alignCast(ptr));
+    assert(self.data_f == null);
+    self.data_f = options.dataFile(self.opts.data) catch |err| {
+        log.warn("error opening data file err={}", .{err});
+        return error.BenchmarkFailed;
+    };
+}
+fn teardown(ptr: *anyopaque) void {
+    const self: *GraphemeBreak = @ptrCast(@alignCast(ptr));
+    if (self.data_f) |f| {
+        f.close(global.io());
+        self.data_f = null;
+    }
+}
+fn stepNoop(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *GraphemeBreak = @ptrCast(@alignCast(ptr));
+    const f = self.data_f orelse return;
+    var read_buf: [4096]u8 align(std.atomic.cache_line) = undefined;
+    var f_reader = f.reader(global.io(), &read_buf);
+    var r = &f_reader.interface;
+    var d: UTF8Decoder = .{};
+    var buf: [4096]u8 align(std.atomic.cache_line) = undefined;
+    while (true) {
+        const n = r.readSliceShort(&buf) catch {
+            log.warn("error reading data file err={?}", .{f_reader.err});
+            return error.BenchmarkFailed;
+        };
+        if (n == 0) break;
+        for (buf[0..n]) |c| {
+            _ = d.next(c);
+        }
+    }
+}
+fn stepTable(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *GraphemeBreak = @ptrCast(@alignCast(ptr));
+    const f = self.data_f orelse return;
+    var read_buf: [4096]u8 align(std.atomic.cache_line) = undefined;
+    var f_reader = f.reader(global.io(), &read_buf);
+    var r = &f_reader.interface;
+    var d: UTF8Decoder = .{};
+    var state: uucode.grapheme.BreakState = .default;
+    var cp1: u21 = 0;
+    var buf: [4096]u8 align(std.atomic.cache_line) = undefined;
+    while (true) {
+        const n = r.readSliceShort(&buf) catch {
+            log.warn("error reading data file err={?}", .{f_reader.err});
+            return error.BenchmarkFailed;
+        };
+        if (n == 0) break;
+        for (buf[0..n]) |c| {
+            const cp_, const consumed = d.next(c);
+            assert(consumed);
+            if (cp_) |cp2| {
+                std.mem.doNotOptimizeAway(unicode.graphemeBreak(cp1, @intCast(cp2), &state));
+                cp1 = cp2;
+            }
+        }
+    }
+}
+test GraphemeBreak {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const impl: *GraphemeBreak = try .create(alloc, .{});
+    defer impl.destroy(alloc);
+    const bench = impl.benchmark();
+    _ = try bench.run(.once);
+}

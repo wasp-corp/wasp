@@ -1,0 +1,49 @@
+{
+  "configurations" : [
+    {
+      "id" : "22895D97-CB9E-4452-A6AA-702CC0152032",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "commandLineArgumentEntries" : [
+      {
+        "argument" : "-NS🐞 YES"
+      }
+    ],
+    "environmentVariableEntries" : [
+      {
+        "key" : "WASP_CONFIG_PATH",
+        "value" : "\/tmp\/Wasp\/testing_config.wasp"
+      }
+    ],
+    "performanceAntipatternCheckerEnabled" : true,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:Wasp.xcodeproj",
+      "identifier" : "A5B30530299BEAAA0047F10C",
+      "name" : "Wasp"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:Wasp.xcodeproj",
+        "identifier" : "A54F45F22E1F047A0046BD5C",
+        "name" : "WaspTests"
+      }
+    },
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:Wasp.xcodeproj",
+        "identifier" : "810ACC9E2E9D3301004F8F92",
+        "name" : "WaspUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

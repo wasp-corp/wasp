@@ -1,0 +1,35 @@
+const oscpkg = @import("../osc.zig");
+const protocol = @import("../osc/parsers/kitty_clipboard_protocol.zig");
+const command = @import("clipboard_command.zig");
+const write = @import("clipboard_write.zig");
+const response = @import("clipboard_response.zig");
+const grants = @import("clipboard_grants.zig");
+pub const OSC = protocol.OSC;
+pub const Operation = protocol.Operation;
+pub const Status = protocol.Status;
+pub const Terminator = oscpkg.Terminator;
+pub const Metadata = command.Metadata;
+pub const Payload = command.Payload;
+pub const readPromptExempt = command.readPromptExempt;
+pub const max_id_len = command.max_id_len;
+pub const max_pw_len = command.max_pw_len;
+pub const max_mime_len = command.max_mime_len;
+pub const max_name_len = command.max_name_len;
+pub const Content = write.Content;
+pub const WriteState = write.WriteState;
+pub const max_write_size = write.max_write_size;
+pub const max_write_mimes = write.max_write_mimes;
+pub const max_write_aliases = write.max_write_aliases;
+pub const Response = response.Response;
+pub const ReadSuccess = response.ReadSuccess;
+pub const PasteEvent = response.PasteEvent;
+pub const read_chunk_size = response.read_chunk_size;
+pub const max_read_mimes = response.max_read_mimes;
+pub const max_listing_mimes = response.max_listing_mimes;
+pub const targets_mime = response.targets_mime;
+pub const Grants = grants.Grants;
+pub const otp_len = grants.otp_len;
+pub const generateOtp = grants.generateOtp;
+test {
+    @import("std").testing.refAllDecls(@This());
+}

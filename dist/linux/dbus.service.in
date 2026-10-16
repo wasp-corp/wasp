@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=@APPID@
+SystemdService=app-@APPID@.service
+Exec=@WASP@ --gtk-single-instance=true --initial-window=false

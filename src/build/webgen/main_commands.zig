@@ -1,0 +1,44 @@
+const std = @import("std");
+const Action = @import("../../cli/wasp.zig").Action;
+const help_strings = @import("help_strings");
+pub fn main(init: std.process.Init) !void {
+    var buffer: [2048]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &buffer);
+    const stdout = &stdout_writer.interface;
+    try genActions(stdout);
+}
+pub fn genActions(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
+        \\---
+        \\title: Reference
+        \\description: Reference of all Wasp action subcommands.
+        \\editOnGithubLink: https://github.com/wasp-org/wasp/tree/main/src/cli
+        \\---
+        \\Wasp includes a number of utility actions that can be accessed as subcommands.
+        \\Actions provide utilities to work with config, list keybinds, list fonts, demo themes,
+        \\and debug.
+        \\
+    );
+    inline for (@typeInfo(Action).@"enum".fields) |field| {
+        const action = std.meta.stringToEnum(Action, field.name).?;
+        switch (action) {
+            .help, .version => try writer.writeAll("## " ++ field.name ++ "\n"),
+            else => try writer.writeAll("## " ++ field.name ++ "\n"),
+        }
+        if (@hasDecl(help_strings.Action, field.name)) {
+            var iter = std.mem.splitScalar(u8, @field(help_strings.Action, field.name), '\n');
+            var first = true;
+            while (iter.next()) |s| {
+                try writer.writeAll(s);
+                try writer.writeAll("\n");
+                first = false;
+            }
+            try writer.writeAll("\n```\n");
+            switch (action) {
+                .help, .version => try writer.writeAll("wasp --" ++ field.name ++ "\n"),
+                else => try writer.writeAll("wasp +" ++ field.name ++ "\n"),
+            }
+            try writer.writeAll("```\n\n");
+        }
+    }
+}
