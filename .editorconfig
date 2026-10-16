@@ -1,0 +1,113 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.blp]
+indent_size = 2
+indent_style = space
+
+[*.cmake]
+indent_size = 2
+indent_style = space
+
+[*.json]
+indent_size = 2
+indent_style = space
+
+[*.nix]
+indent_size = 2
+indent_style = space
+
+[*.py]
+indent_size = 4
+indent_style = space
+
+[*.swift]
+indent_size = 4
+indent_style = space
+trim_trailing_whitespace = true
+
+[*.toml]
+indent_size = 2
+indent_style = space
+
+[*.{c,h,cpp,hpp,cc,cxx,m,mm}]
+indent_size = 4
+indent_style = space
+
+[*.{css,scss}]
+indent_size = 2
+indent_style = space
+
+[*.{glsl,vert,frag,metal}]
+indent_size = 4
+indent_style = space
+
+[*.{html,htm}]
+indent_size = 2
+indent_style = space
+
+[*.{js,mjs,ts,tsx}]
+indent_size = 2
+indent_style = space
+
+[*.{md,markdown,rst,txt}]
+trim_trailing_whitespace = false
+indent_size = 2
+indent_style = space
+
+[*.{png,jpg,jpeg,gif,ico,icns,ttf,otf,woff,woff2,bin,dat,dmp}]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{rc,manifest}]
+end_of_line=crlf
+charset=utf-8
+indent_style=space
+indent_size=4
+trim_trailing_whitespace=true
+insert_final_newline=true
+
+[*.{sh,bash,elv,nu,fish,zsh}]
+indent_size = 2
+indent_style = space
+
+[*.{xml,ui}]
+indent_size = 2
+indent_style = space
+
+[*.{yml,yaml}]
+indent_size = 2
+indent_style = space
+
+[*.{zig,zon}]
+indent_size = 4
+indent_style = space
+
+[CMakeLists.txt]
+indent_size = 2
+indent_style = space
+
+[Makefile]
+indent_style = tab
+indent_size = 8
+
+[bash-preexec.sh]
+indent_size = 4
+indent_style = space
+
+[{zig-cache,zig-out,vendor,.jj,.git}/**]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
